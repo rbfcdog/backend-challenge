@@ -1,5 +1,135 @@
 # Technical Challenge — Distributed Wagering Processor
 
+## Executando a implementação
+
+Serviço financeiro em Bun 1.3.14, NestJS, TypeScript estrito, MikroORM e
+PostgreSQL, com entrada HTTP/SQS, ledger imutável, inbox/outbox persistentes e
+workers de publicação e recuperação de referências, além de partidas dobradas.
+Decisões, invariantes, contratos e limites: [ARCHITECTURE.md](ARCHITECTURE.md).
+O texto original do desafio está preservado após esta seção de setup.
+
+> **Uso local, sem autenticação:** `LocalProviderIdentity` valida o identificador
+> do provedor, mas não autentica nem autoriza chamadas. Não exponha os endpoints
+> financeiros publicamente; o ponto de integração com IdP externo está descrito
+> na arquitetura.
+
+### Tudo em containers
+
+Pré-requisitos: Docker com Compose e portas locais 3000, 5432 e 4566 disponíveis.
+
+```sh
+docker compose up --build -d --wait
+curl --fail http://localhost:3000/health/live
+curl --fail http://localhost:3000/health/ready
+curl --fail http://localhost:3000/metrics
+docker compose down
+```
+
+O startup provisiona as filas FIFO `wager-transactions.fifo`,
+`wager-transactions-dlq.fifo` e `wager-events.fifo`; o container local aplica
+migrations antes de iniciar HTTP e workers. PostgreSQL usa volume nomeado;
+`docker compose down` preserva seus dados, mas o LocalStack não tem volume persistente.
+As credenciais de desenvolvimento e o LocalStack não são configuração de produção.
+
+### Desenvolvimento com Bun no host
+
+```sh
+cp .env.example .env
+bun install --frozen-lockfile
+docker compose up -d --wait postgres localstack
+bun run db:migrate
+bun run dev
+```
+
+Bun carrega `.env` automaticamente. Os nomes, URLs das filas e controles dos
+workers estão em `.env.example` e na tabela de configuração da arquitetura.
+`GET /health/live` verifica o processo; `GET /health/ready` exige PostgreSQL e
+as filas configuradas acessíveis. Health é público; readiness indisponível retorna `503`.
+
+### Exemplo financeiro HTTP
+
+```sh
+curl --fail-with-body -X POST http://localhost:3000/wallets \
+  -H 'Content-Type: application/json' \
+  -d '{"playerId":"0192f28f-5dc0-7d58-bdb2-814ad6a0f4a1","initialBalance":{"amount":"100.00","currency":"BRL"}}'
+```
+
+Use o `id` retornado como `walletId` no exemplo abaixo:
+
+```sh
+curl --fail-with-body -X POST http://localhost:3000/wagering/transactions \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: provider-a:transaction-123' \
+  -H 'X-Correlation-Id: demo-123' \
+  -d '{"providerId":"provider-a","externalTransactionId":"transaction-123","playerId":"0192f28f-5dc0-7d58-bdb2-814ad6a0f4a1","walletId":"SUBSTITUA_PELO_ID_RETORNADO","roundId":"round-987","gameId":"fortune-chimp","kind":"BET","money":{"amount":"25.00","currency":"BRL"}}'
+```
+
+Reenviar o mesmo comando retorna replay persistente, sem novo débito.
+Dinheiro é sempre string decimal com duas casas, nunca número JSON.
+Consulte saldo e auditoria com `GET /wallets/:walletId`,
+`GET /wallets/:walletId/ledger?limit=50` e
+`POST /wallets/:walletId/reconciliation`.
+Rejeições financeiras retornam `422`; referência pendente, `202`;
+conflitos, `409`; payload inválido, `400`; falha de infraestrutura, `503`.
+O `failureCode`/`code`, não o texto da mensagem, é o contrato de erro.
+
+### Diferenciais opcionais implementados
+
+Cada lançamento financeiro é um journal com dois postings imutáveis e balanceados,
+gerados na mesma transação SQL. O ledger HTTP inclui `postings`; a reconciliação
+inclui `accounting`, além dos campos existentes. A migration faz backfill do histórico
+sem alterar saldos ou emitir novos eventos.
+
+```sh
+# Banco temporário, filas e três processos isolados; não reseta dados da aplicação:
+bun run test:load
+
+# Compara concorrências 1, 24 e 48 em sequência, sem executar perfis em paralelo:
+bun run test:load:matrix
+```
+
+Por padrão, o benchmark mede 1.000 requisições por cenário, com concorrência 24:
+wallets distintas, uma wallet disputada e replay da mesma operação. O JSON gerado
+é `load-results.json`; `LOAD_REPORT` permite escolher outro caminho.
+[Resultado medido completo](benchmarks/baseline.json) e
+[ambiente, metodologia e análise](ARCHITECTURE.md#10-reproducible-local-load-benchmark)
+registram throughput HTTP e financeiro, p50/p95/p99, erros, conflitos, retries e
+outbox lag. O benchmark exige PostgreSQL/LocalStack locais e permissões para criar
+e remover seus próprios bancos/filas; não é uma estimativa de capacidade de produção.
+O comparativo grava `benchmarks/concurrency-1.json`, `benchmarks/baseline.json`
+e `benchmarks/concurrency-48.json`. A reconciliação também verifica a cadeia de
+saldos/versões; totais coincidentes não tornam um histórico quebrado consistente.
+
+### Verificação e migrations
+
+```sh
+bun run typecheck
+bun run test:unit
+# Requer PostgreSQL e LocalStack reais de desenvolvimento:
+bun run test:integration
+
+# Reverte a última migration; destrutivo, somente em banco descartável:
+bun run db:rollback
+bun run db:migrate
+```
+
+A suíte cria banco, filas FIFO e processos isolados. Requer o superusuário PostgreSQL
+local para simular divergência no banco temporário, além de criar/remover bancos,
+encerrar suas conexões e gerenciar filas. O script carrega `.env.example`;
+use apenas infraestrutura de desenvolvimento. Não é necessário iniciar a API
+manualmente para essa suíte.
+
+Verificado: typecheck, 43 testes unitários e a suíte real PostgreSQL/SQS passaram.
+A suíte reconciliou 20 wallets e recebeu os 251 eventos confirmados, incluindo
+reversões simultâneas em três processos, histórico divergente, crash antes do ACK,
+retries/DLQ e recuperação.
+O benchmark local foi executado e seus resultados estão registrados nos links acima.
+Em deployment, execute migrations em **um job único antes de escalar** a aplicação;
+não use sincronização automática de schema. Rollback financeiro remove auditoria:
+faça backup e não o use como compensação de transações.
+
+---
+
 ## Bem-vindo à Jungle Gaming 🦧
 
 A **Jungle Gaming** é uma software house especializada em iGaming — desenvolvemos plataformas de cassino online com tecnologia de ponta: NestJS, Bun, TanStack, DDD e arquitetura orientada a eventos. Somos apaixonados por engenharia de software e acreditamos que grandes produtos nascem de grandes times.
